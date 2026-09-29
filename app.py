@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import relief as relief_mod
+from duty import over_limit_legs
+
 PORT = 8202
 ROLES = {"viewer", "scheduler", "ops_manager", "auditor"}
 
@@ -96,6 +99,12 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS crew_reliefs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES recovery_plans(id) ON DELETE CASCADE,
+                assignment_id INTEGER NOT NULL REFERENCES assignments(id), flight_id INTEGER NOT NULL REFERENCES flights(id),
+                from_crew_id TEXT NOT NULL REFERENCES crew(id), to_crew_id TEXT NOT NULL REFERENCES crew(id),
+                reason TEXT NOT NULL, detail_json TEXT, created_by TEXT NOT NULL, created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -148,8 +157,11 @@ class AirlineRecoveryService:
         duty = parse_time(body.get("duty_start")); maximum = body.get("max_duty_minutes")
         if not ident or not name or not base or not isinstance(maximum, int) or maximum <= 0:
             raise ApiError(400, "invalid_crew", "id、name、base 和正整数 max_duty_minutes 必填")
+        status = body.get("status", "active")
+        if status not in {"active", "reserve", "inactive"}:
+            raise ApiError(400, "invalid_crew_status", "status 只能是 active、reserve 或 inactive")
         with self.repo.tx() as conn:
-            conn.execute("INSERT OR REPLACE INTO crew(id,name,base,duty_start,max_duty_minutes,status) VALUES(?,?,?,?,?,?)", (ident, name, base, iso(duty), maximum, body.get("status", "active")))
+            conn.execute("INSERT OR REPLACE INTO crew(id,name,base,duty_start,max_duty_minutes,status) VALUES(?,?,?,?,?,?)", (ident, name, base, iso(duty), maximum, status))
             return dict(conn.execute("SELECT * FROM crew WHERE id=?", (ident,)).fetchone())
 
     def create_permit(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -278,7 +290,7 @@ class AirlineRecoveryService:
             destination = conn.execute("SELECT * FROM airports WHERE code=?", (row["destination"],)).fetchone()
             if not aircraft or aircraft["status"] != "active": problems.append({"assignment_id": row["id"], "code": "aircraft_unavailable"})
             elif parse_time(aircraft["maintenance_due"]) < sta: problems.append({"assignment_id": row["id"], "code": "maintenance_due", "resource": aircraft["id"]})
-            if not crew or crew["status"] != "active": problems.append({"assignment_id": row["id"], "code": "crew_unavailable"})
+            if not crew or crew["status"] not in {"active", "reserve"}: problems.append({"assignment_id": row["id"], "code": "crew_unavailable"})
             if not origin or not destination: problems.append({"assignment_id": row["id"], "code": "airport_unknown"})
             if crew:
                 duty_start, max_duty = parse_time(crew["duty_start"]), crew["max_duty_minutes"]
@@ -382,6 +394,122 @@ class AirlineRecoveryService:
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
 
+    def _serialize_leg(self, leg: dict[str, Any]) -> dict[str, Any]:
+        out = dict(leg)
+        for key in ("std", "sta"):
+            if key in out and not isinstance(out[key], str):
+                out[key] = iso(out[key])
+        return out
+
+    def crew_duty(self, plan_id: int) -> dict[str, Any]:
+        """按方案实时计算机组累计执勤、超限航段，并为每个超限航段列出后备人选。"""
+        conn = self.repo.conn
+        plan = conn.execute("SELECT id,name,status,revision FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+        if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+        data = relief_mod.crew_duty_summaries(conn, plan_id)
+        summaries = []
+        for summary in data["summaries"]:
+            item = dict(summary)
+            item["duty_start"] = iso(summary["duty_start"])
+            item["legs"] = [self._serialize_leg(leg) for leg in summary["legs"]]
+            summaries.append(item)
+        legs = [self._serialize_leg(leg) for leg in data["over_limit_legs"]]
+        for leg in legs:
+            current = conn.execute("""SELECT c.* FROM crew c JOIN assignments a ON a.crew_id=c.id WHERE a.id=?""", (leg["assignment_id"],)).fetchone()
+            leg["current_crew_id"] = current["id"]
+            leg["current_crew_name"] = current["name"]
+            raw_candidates = relief_mod.eligible_backups(conn, plan_id, {
+                "assignment_id": leg["assignment_id"], "flight_id": leg["flight_id"],
+                "flight_no": leg.get("flight_no"), "current_crew_id": current["id"],
+                "origin": leg["origin"], "destination": leg["destination"],
+                "std": parse_time(leg["std"]), "sta": parse_time(leg["sta"]),
+            })
+            leg["candidates"] = [self._serialize_candidate(c) for c in raw_candidates]
+        return {"plan": dict(plan), "crew_duty": summaries,
+                "over_limit_legs": legs, "reliefs": relief_mod.list_reliefs(conn, plan_id)}
+
+    @staticmethod
+    def _serialize_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+        out = dict(candidate)
+        if not isinstance(out["duty_start"], str): out["duty_start"] = iso(out["duty_start"])
+        out["conflicts"] = [
+            {**c, "start": iso(c["start"]) if not isinstance(c["start"], str) else c["start"],
+             "end": iso(c["end"]) if not isinstance(c["end"], str) else c["end"]}
+            for c in candidate["conflicts"]
+        ]
+        return out
+
+    def relieve_plan(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        """把超限航段交给基地匹配、时段不冲突、接上去不超限的后备机组。"""
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "relief_forbidden", "当前角色不能安排机组接替")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int): raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        assignment_id = body.get("assignment_id")
+        backup_id = str(body.get("crew_id", "")).strip()
+        if assignment_id is not None and not isinstance(assignment_id, int):
+            raise ApiError(400, "invalid_assignment", "assignment_id 必须是整数")
+        if not backup_id: raise ApiError(400, "crew_required", "必须指定后备机组 crew_id")
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            if plan["status"] != "draft": raise ApiError(409, "plan_locked", "已锁定方案不能改派机组")
+            if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案版本已变化")
+
+            def eligible_for(leg: dict[str, Any]) -> list[dict[str, Any]]:
+                return relief_mod.eligible_backups(conn, plan_id, leg)
+
+            data = relief_mod.crew_duty_summaries(conn, plan_id)
+            targets = [leg for leg in data["over_limit_legs"]
+                       if assignment_id is None or leg["assignment_id"] == assignment_id]
+            if not targets:
+                if assignment_id is not None:
+                    raise ApiError(409, "leg_not_over_limit", "指定航段没有超限，无需接替")
+                raise ApiError(409, "no_over_limit", "当前方案没有超限航段")
+            records: list[dict[str, Any]] = []
+            unresolved: list[dict[str, Any]] = []
+            relieved_assignment_ids: set[int] = set()
+            for leg in targets:
+                if leg["assignment_id"] in relieved_assignment_ids:
+                    continue
+                current = conn.execute("SELECT crew_id FROM assignments WHERE id=?", (leg["assignment_id"],)).fetchone()
+                leg_view = {**leg, "current_crew_id": current["crew_id"]}
+                candidates = eligible_for(leg_view)
+                chosen = next((c for c in candidates if c["crew_id"] == backup_id), None)
+                if chosen is None and assignment_id is None:
+                    # 一键接替：依次尝试每名合格后备（已按接替后剩余时间排序）
+                    chosen = next((c for c in candidates if c["eligible"]), None)
+                if chosen is None:
+                    if assignment_id is None:
+                        # 自动模式：该段无人可接，留到最终重算统一拦截
+                        unresolved.append({"flight_no": leg["flight_no"],
+                                           "candidates": [self._serialize_candidate(c) for c in candidates]})
+                        continue
+                    raise ApiError(409, "backup_not_eligible",
+                                   f"后备机组 {backup_id} 不能接替航段 {leg['flight_no']}",
+                                   {"candidates": [self._serialize_candidate(c) for c in candidates]})
+                if not chosen["eligible"]:
+                    raise ApiError(409, "backup_not_eligible",
+                                   f"后备机组 {backup_id} 接替后仍不满足约束: {','.join(chosen['reasons'])}",
+                                   {"candidate": self._serialize_candidate(chosen)})
+                record = relief_mod.apply_relief(conn, plan_id, leg["assignment_id"], chosen["crew_id"], actor, role)
+                if record is None:
+                    raise ApiError(404, "assignment_not_found", "待接替的航段不存在或已取消")
+                records.append(record)
+                relieved_assignment_ids.add(leg["assignment_id"])
+            # 接替后原机组当场释放、接上的机组继续累计：重新计算
+            after = relief_mod.crew_duty_summaries(conn, plan_id)
+            remaining = over_limit_legs(after["summaries"])
+            # 一键接替要求全部超限段清零且每段都有人接；单段接替只要求本操作的目标段不再超限
+            if assignment_id is None and (remaining or unresolved):
+                details = {"assignment_ids": [leg["assignment_id"] for leg in remaining]}
+                if unresolved: details["unresolved"] = unresolved
+                raise ApiError(409, "still_over_limit", "接替后仍有超限航段，已拦截止步", details)
+            if any(r["assignment_id"] == assignment_id for r in remaining):
+                raise ApiError(409, "still_over_limit", "接替后该航段仍然超限，已拦截止步",
+                               {"assignment_id": assignment_id})
+            conn.execute("UPDATE recovery_plans SET revision=revision+1 WHERE id=?", (plan_id,))
+        return {"relieved": records, "plan": self.crew_duty(plan_id)}
+
     def get_plan(self, plan_id: int) -> dict[str, Any]:
         conn = self.repo.conn
         plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
@@ -435,6 +563,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state()
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "crew-duty":
+            return 200, self.service.crew_duty(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
@@ -454,6 +584,7 @@ class Handler(BaseHTTPRequestHandler):
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
             if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action == "relieve": return 200, self.service.relieve_plan(plan_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
@@ -464,6 +595,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path == "/":
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            if method == "GET" and parsed.path == "/crew":
+                raw = (self.web_root / "crew.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path)
             respond(self, status, payload)
         except ApiError as exc:

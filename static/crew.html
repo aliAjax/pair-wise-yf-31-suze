@@ -1,0 +1,143 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>机组接替补班</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:32px auto;background:#eef2f7;color:#182230;padding:0 20px}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}
+input,button,select{font:inherit;padding:8px;margin:4px}
+button{background:#0f766e;color:white;border:0;border-radius:6px;cursor:pointer}
+button:disabled{background:#9aa4b2;cursor:not-allowed}
+a{color:#0f766e}
+table{border-collapse:collapse;width:100%;margin-top:10px}
+th,td{border-bottom:1px solid #e5e7eb;padding:8px 10px;text-align:left;font-size:14px;vertical-align:top}
+th{background:#f8fafc}
+.bad{color:#b91c1c;font-weight:600}.ok{color:#15803d}.muted{color:#64748b}
+.tag{display:inline-block;background:#fee2e2;color:#b91c1c;border-radius:999px;padding:2px 10px;font-size:12px;margin-right:6px}
+.tag.ok{background:#dcfce7;color:#15803d}.tag.mut{background:#e2e8f0;color:#475569}
+.card{border:1px solid #e5e7eb;border-radius:10px;padding:12px;margin:10px 0}
+.card.over{border-color:#fca5a5;background:#fff7f7}
+code{background:#f1f5f9;padding:1px 6px;border-radius:4px}
+</style>
+<h1>机组接替补班</h1>
+<p>每次调整后按机组累计执勤，标出超限航段；从基地匹配、时段不冲突、接上去不超限的后备机组中接替，原机组当场释放航段。<a href="/">← 返回总控台</a></p>
+<section>
+  <label>X-User-Id <input id="u" value="sched" style="width:90px"></label>
+  <label>X-Role
+    <select id="r"><option value="scheduler">scheduler</option><option value="ops_manager">ops_manager</option><option value="auditor">auditor</option><option value="viewer">viewer</option></select>
+  </label>
+  <label>方案 ID <input id="pid" value="1" style="width:70px"></label>
+  <button onclick="load()">查询累计执勤</button>
+  <button onclick="autoRelieveAll()">一键接替全部超限航段</button>
+  <span id="head" class="muted"></span>
+  <div id="msg"></div>
+</section>
+<section>
+  <h2>超限机组与航段</h2>
+  <div id="overBox" class="muted">尚未加载。</div>
+</section>
+<section>
+  <h2>各机组执勤累计</h2>
+  <div id="dutyBox"></div>
+</section>
+<section>
+  <h2>换班记录</h2>
+  <div id="logBox" class="muted">暂无换班记录。</div>
+</section>
+<script>
+const $=id=>document.getElementById(id);
+function hdr(){return {'X-User-Id':$('u').value,'X-Role':$('r').value,'Content-Type':'application/json'}}
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function hhmm(mins){
+  if(mins===null||mins===undefined)return '-';
+  const h=Math.floor(mins/60),m=((mins%60)+60)%60;
+  return `${h}小时${String(m).padStart(2,'0')}分`;
+}
+function t(s){return s?s.replace('T',' ').replace('Z',' UTC'):'-'}
+let DATA=null;
+async function api(path,opt){
+  const x=await fetch(path,{headers:hdr(),...opt});
+  const j=await x.json();
+  if(!x.ok){throw Object.assign(new Error(j.message||x.statusText),{payload:j})}
+  return j;
+}
+async function load(){
+  $('msg').innerHTML='';
+  const pid=$('pid').value.trim();
+  try{
+    DATA=await api(`/api/plans/${encodeURIComponent(pid)}/crew-duty`);
+    render();
+  }catch(e){showError(e);DATA=null;renderEmpty()}
+}
+function showError(e){
+  $('msg').innerHTML=`<p class="bad">${esc(e.message)}</p>`+(e.payload&&e.payload.details?`<pre>${esc(JSON.stringify(e.payload.details,null,2))}</pre>`:'');
+}
+function renderEmpty(){$('overBox').className='muted';$('overBox').textContent='未能加载方案。';$('dutyBox').innerHTML='';$('logBox').className='muted';$('logBox').textContent='暂无换班记录。';$('head').textContent=''}
+function render(){
+  const p=DATA.plan;
+  $('head').innerHTML=`方案 <b>#${p.id}</b> ${esc(p.name)}　状态：<span class="${p.status==='locked'?'ok':''}">${p.status}</span>　版本 r${p.revision}`;
+  const legs=DATA.over_limit_legs||[];
+  if(!legs.length){
+    $('overBox').className='ok';$('overBox').innerHTML='✓ 当前方案没有超限航段。';
+  }else{
+    $('overBox').className='';
+    $('overBox').innerHTML=legs.map((leg,i)=>{
+      const cands=leg.candidates||[];
+      const ok=cands.filter(c=>c.eligible);
+      return `<div class="card over">
+        <div><span class="tag">超限 +${leg.excess_minutes} 分钟</span>
+          <b>${esc(leg.flight_no)}</b> ${esc(leg.origin)}→${esc(leg.destination)}
+          ${t(leg.std)} ~ ${t(leg.sta)}</div>
+        <div class="muted">现机组：<b>${esc(leg.current_crew_name)}</b>（${esc(leg.current_crew_id)}），
+          累计执勤 ${hhmm(leg.cumulative_minutes)} / 上限 ${hhmm(leg.limit_minutes)}，
+          航段 #${leg.assignment_id}</div>
+        <div><b>可接替人选</b>（同基地 ${esc(leg.origin)}、时段不冲突、接上去不超限）：</div>
+        <table><thead><tr><th>机组</th><th>基地</th><th>当前累计</th><th>接替后剩余</th><th>判定</th><th>操作</th></tr></thead><tbody>
+        ${cands.length?cands.map(c=>`<tr>
+          <td>${esc(c.name)} <code>${esc(c.crew_id)}</code></td>
+          <td>${esc(c.base)}</td>
+          <td>${hhmm(c.projected_duty_minutes)}</td>
+          <td class="${c.projected_remaining_minutes>=0?'ok':'bad'}">${hhmm(c.projected_remaining_minutes)}</td>
+          <td>${c.eligible?'<span class="tag ok">可接替</span>':c.reasons.map(r=>`<span class="tag">${esc(reasonText(r))}</span>`).join('')}</td>
+          <td>${c.eligible?`<button onclick="relieve(${leg.assignment_id},'${esc(c.crew_id)}')">接替该段</button>`:''}</td>
+        </tr>`).join(''):'<tr><td colspan="6" class="muted">没有后备机组。</td></tr>'}
+        </tbody></table>
+        ${!ok.length?'<p class="bad">无合格后备人选：该段无法接替，校验/锁定将被拦截。</p>':''}
+      </div>`;
+    }).join('');
+  }
+  const ds=DATA.crew_duty||[];
+  $('dutyBox').innerHTML=ds.length?`<table><thead><tr><th>机组</th><th>基地</th><th>状态</th><th>航段</th><th>累计执勤</th><th>剩余</th><th>航段明细</th></tr></thead><tbody>
+    ${ds.map(d=>`<tr>
+      <td>${esc(d.name)} <code>${esc(d.crew_id)}</code></td>
+      <td>${esc(d.base)}</td>
+      <td>${d.over_limit?'<span class="tag">超限</span>':'<span class="tag ok">正常</span>'}</td>
+      <td>${d.leg_count}</td>
+      <td class="${d.over_limit?'bad':''}">${hhmm(d.duty_minutes)} / ${hhmm(d.max_duty_minutes)}</td>
+      <td class="${d.remaining_minutes<0?'bad':'ok'}">${hhmm(d.remaining_minutes)}</td>
+      <td>${d.legs.map(l=>`<div class="${l.over_limit?'bad':''}">#${l.assignment_id} ${esc(l.flight_no)} ${t(l.std)} 起，累计 ${hhmm(l.cumulative_minutes)}${l.over_limit?` ⚠ 超 ${l.excess_minutes} 分`:''}</div>`).join('')}</td>
+    </tr>`).join('')}
+  </tbody></table>`:'<p class="muted">方案内暂无执行中的航段。</p>';
+  const logs=DATA.reliefs||[];
+  if(logs.length){
+    $('logBox').className='';
+    $('logBox').innerHTML=`<table><thead><tr><th>#</th><th>航段</th><th>原机组</th><th>接替机组</th><th>原因</th><th>操作人</th><th>时间</th></tr></thead><tbody>
+      ${logs.map(r=>`<tr><td>${r.id}</td><td>${esc(r.flight_no||r.flight_id)} (#${r.assignment_id})</td>
+        <td><code>${esc(r.from_crew_id)}</code></td><td><code>${esc(r.to_crew_id)}</code></td>
+        <td><span class="tag">${esc(reasonText(r.reason))}</span></td><td>${esc(r.created_by)}</td><td>${t(r.created_at)}</td></tr>`).join('')}
+    </tbody></table>`;
+  }else{$('logBox').className='muted';$('logBox').textContent='暂无换班记录。'}
+}
+function reasonText(r){return {base_mismatch:'基地不符',time_conflict:'时段冲突',would_exceed_duty:'接替后超限',current_crew:'本人执飞',duty_limit:'执勤超限'}[r]||r}
+async function relieve(assignmentId,crewId){
+  try{
+    DATA=(await api(`/api/plans/${$('pid').value.trim()}/relieve`,{method:'POST',body:JSON.stringify({expected_revision:DATA.plan.revision,assignment_id:assignmentId,crew_id:crewId})})).plan;
+    $('msg').innerHTML=`<p class="ok">✓ 航段 #${assignmentId} 已由 ${esc(crewId)} 接替，原机组航段已释放。</p>`;render();
+  }catch(e){showError(e)}
+}
+async function autoRelieveAll(){
+  try{
+    const j=await api(`/api/plans/${$('pid').value.trim()}/relieve`,{method:'POST',body:JSON.stringify({expected_revision:DATA?DATA.plan.revision:1,crew_id:'__auto__'})});
+    DATA=j.plan;
+    $('msg').innerHTML=`<p class="ok">✓ 已自动接替 ${j.relieved.length} 个超限航段。</p>`;render();
+  }catch(e){showError(e);await load()}
+}
+load();
+</script>
