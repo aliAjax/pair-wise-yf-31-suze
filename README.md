@@ -19,6 +19,9 @@ python3 app.py --db airline_recovery.db
 - `POST /api/recovery-plans`：一次提交方案及航班调整。
 - `POST /api/plans/{id}/assignments`：用 `expected_revision` 临时改派。
 - `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
+- `GET /api/plans/{id}/crew-board`：按机组累计执勤，标出超限航段并附后备接替人选。
+- `POST /api/plans/{id}/relieve`：从后备机组接替超限航段（需 `expected_revision`），原机组当场释放、接班机组继续累计，再超限直接拦截。
+- 页面入口：`/crew`（机组接替补班：超限机组、可接替人选、换班记录）。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
 - `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
 - `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。

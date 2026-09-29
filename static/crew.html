@@ -1,0 +1,98 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>机组接替补班</title>
+<style>
+body{font:15px system-ui;max-width:1180px;margin:30px auto;background:#eef2f7;color:#182230;padding:0 20px}
+section{background:white;padding:18px 20px;border-radius:12px;margin:14px 0;box-shadow:0 2px 10px #0001}
+input,select,button{font:inherit;padding:7px;margin:3px}
+button{background:#0f766e;color:white;border:0;border-radius:6px;cursor:pointer}
+button:disabled{background:#9aa6b2;cursor:not-allowed}
+a{color:#0f766e}
+table{border-collapse:collapse;width:100%;margin-top:8px}
+th,td{border:1px solid #d8dee7;padding:6px 9px;text-align:left;font-size:13px}
+th{background:#f1f5f9}
+.bad{background:#fee2e2;color:#991b1b;font-weight:600}
+.ok{color:#166534}
+.muted{color:#64748b}
+.tag{display:inline-block;padding:1px 7px;border-radius:10px;font-size:12px;margin-right:4px}
+.tag.over{background:#fecaca;color:#991b1b}
+.tag.standby{background:#dbeafe;color:#1e40af}
+.tag.active{background:#dcfce7;color:#166534}
+#msg{min-height:20px;font-weight:600}
+</style>
+<h1>机组接替补班</h1>
+<p><a href="/">← 返回恢复控制台</a>　每次调整后按机组累计执勤，超限航段当场标红，可从基地对得上、时段不冲突的后备机组直接换班。</p>
+<section>
+  身份 <input id="u" value="sched" style="width:90px"> 角色
+  <select id="r"><option value="scheduler">scheduler</option><option value="ops_manager">ops_manager</option><option value="auditor">auditor</option><option value="viewer">viewer</option></select>
+  方案 <select id="plans" style="max-width:420px"></select><input id="pid" placeholder="或输入方案 ID" style="width:130px">
+  <button onclick="loadBoard()">查询</button><span id="msg" class="bad"></span>
+</section>
+<section>
+  <h2>① 超限机组与可接替人选</h2>
+  <div id="overruns" class="muted">加载中…</div>
+</section>
+<section>
+  <h2>② 各机组执勤累计</h2>
+  <div id="crews"></div>
+</section>
+<section>
+  <h2>③ 换班记录</h2>
+  <div id="records"></div>
+</section>
+<script>
+let board=null;
+const hdr=()=>({'X-User-Id':u.value,'X-Role':r.value});
+function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function hm(iso){return iso?iso.replace('T',' ').replace('Z',''):''}
+async function loadPlans(){
+  let x=await fetch('/api/state',{headers:hdr()});
+  if(!x.ok){msg('状态加载失败: '+x.status);return}
+  let d=await x.json();
+  plans.innerHTML=d.plans.map(p=>`<option value="${p.id}">#${p.id} ${esc(p.name)}（${p.status}, rev ${p.revision}）</option>`).join('')
+    || '<option value="">暂无方案</option>';
+  plans.onchange=()=>{pid.value='';loadBoard()};
+}
+function msg(t){document.getElementById('msg').textContent=t||''}
+async function loadBoard(){
+  msg('');
+  let id=(pid.value||plans.value);
+  if(!id){document.getElementById('overruns').innerHTML='<span class="muted">请先选择或输入方案</span>';return}
+  let x=await fetch(`/api/plans/${id}/crew-board`,{headers:hdr()});
+  let d=await x.json();
+  if(!x.ok){msg(d.message||('加载失败 '+x.status));return}
+  board=d;render();
+}
+function reasonLabel(c){return {'time_conflict':'时段冲突','base_mismatch':'基地不符','duty_limit':'接后超限','inactive':'已停用'}[c]||c}
+function render(){
+  let p=board.plan;
+  msg(`方案 #${p.id} ${p.name} · ${p.status} · rev ${p.revision}`);
+  let o=board.overruns;
+  if(!o.length){
+    overruns.innerHTML='<p class="ok">✓ 当前方案没有机组执勤超限航段。</p>';
+  }else{
+    overruns.innerHTML='<table><tr><th>超限航段</th><th>航线/时段</th><th>超限机组</th><th>累计/上限</th><th>可接替人选（后备机组）</th></tr>'+o.map(v=>{
+      let ok=v.candidates.filter(c=>c.eligible), blocked=v.candidates.filter(c=>!c.eligible);
+      let cand=(ok.length?ok.map(c=>`<div><span class="tag standby">${esc(c.status)}</span><b>${esc(c.crew_name)}</b> ${esc(c.crew_id)} · 基地 ${esc(c.base)} · 接后累计 ${c.projected_cumulative_minutes}/${c.max_duty_minutes} 分 <button onclick="relieve(${v.assignment_id},'${esc(c.crew_id)}')">接替</button></div>`).join(''):'<div class="bad">无合格后备：</div>');
+      let blk=blocked.map(c=>`<div class="muted">✗ ${esc(c.crew_name)} ${esc(c.crew_id)}：${c.reject_reasons.map(reasonLabel).join('、')}${c.conflict_assignment_ids.length?'（航段 '+c.conflict_assignment_ids.join(',')+'）':''}</div>`).join('');
+      return `<tr class="bad"><td><span class="tag over">超限</span>${esc(v.flight_no)}（#${v.assignment_id}）</td><td>${esc(v.origin)}→${esc(v.destination)}<br>${hm(v.new_std)} ~ ${hm(v.new_sta)}</td><td>${esc(v.crew_name)} ${esc(v.crew_id)}<br><span class="muted">签到 ${hm(v.duty_start)}</span></td><td>${v.cumulative_minutes}/${v.max_duty_minutes} 分<br>超 ${v.overtime_minutes} 分</td><td>${cand}${blk}</td></tr>`;
+    }).join('')+'</table>';
+  }
+  crews.innerHTML='<table><tr><th>机组</th><th>基地/状态</th><th>签到</th><th>已用/上限</th><th>剩余</th><th>航段累计明细</th></tr>'+
+    board.crews.map(c=>`<tr class="${c.overrun?'bad':''}"><td>${esc(c.crew_name)} ${esc(c.crew_id)}</td><td>${esc(c.crew_base)} <span class="tag ${c.crew_status}">${esc(c.crew_status)}</span></td><td>${hm(c.duty_start)}</td><td>${c.used_minutes}/${c.max_duty_minutes}</td><td>${c.remaining_minutes}</td><td>${c.legs.map(l=>`<div class="${l.overrun?'bad':''}">${l.sequence}. ${esc(l.flight_no)} ${esc(l.origin)}→${esc(l.destination)}：累计 ${l.cumulative_minutes} 分${l.overrun?' ⛔ 超限 '+l.overtime_minutes+' 分':''}</div>`).join('')}</td></tr>`).join('')+'</table>';
+  let rs=board.relief_records;
+  records.innerHTML=rs.length
+    ? '<table><tr><th>#</th><th>时间</th><th>航段</th><th>航线</th><th>释放机组</th><th>接班机组（基地）</th><th>接后累计/上限</th><th>操作人</th></tr>'+
+      rs.map(r=>`<tr><td>${r.id}</td><td>${hm(r.created_at)}</td><td>${esc(r.flight_no)}</td><td>${esc(r.origin)}→${esc(r.destination)}</td><td>${esc(r.released_crew_id)}</td><td><b>${esc(r.relief_crew_id)}</b>（${esc(r.relief_base)}）</td><td>${r.projected_cumulative_minutes}/${r.max_duty_minutes}</td><td>${esc(r.created_by)}</td></tr>`).join('')+'</table>'
+    : '<p class="muted">暂无换班记录。</p>';
+}
+async function relieve(assignmentId,crewId){
+  let rev=board.plan.revision;
+  if(!confirm(`确认让 ${crewId} 接替航段 #${assignmentId}？（rev ${rev}）`))return;
+  msg('换班中…');
+  let x=await fetch(`/api/plans/${board.plan.id}/relieve`,{method:'POST',headers:{'Content-Type':'application/json',...hdr()},
+    body:JSON.stringify({assignment_id:assignmentId,relief_crew_id:crewId,expected_revision:rev})});
+  let d=await x.json();
+  if(!x.ok){msg((d.message||'换班被拦截')+(d.details?(' '+JSON.stringify(d.details)):''));return}
+  board=d.board;msg('换班成功：'+d.relief.released_crew_id+' → '+d.relief.relief_crew_id);render();
+}
+(async()=>{await loadPlans();await loadBoard()})();
+</script>

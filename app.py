@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import crew_duty
+import crew_relief
+
 PORT = 8202
 ROLES = {"viewer", "scheduler", "ops_manager", "auditor"}
 
@@ -96,6 +99,14 @@ class Repository:
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS crew_relief(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES recovery_plans(id) ON DELETE CASCADE,
+                assignment_id INTEGER NOT NULL REFERENCES assignments(id), flight_id INTEGER NOT NULL REFERENCES flights(id),
+                flight_no TEXT NOT NULL, origin TEXT NOT NULL, destination TEXT NOT NULL,
+                released_crew_id TEXT NOT NULL, relief_crew_id TEXT NOT NULL, relief_base TEXT NOT NULL,
+                new_std TEXT NOT NULL, new_sta TEXT NOT NULL, projected_cumulative_minutes INTEGER NOT NULL,
+                max_duty_minutes INTEGER NOT NULL, created_by TEXT NOT NULL, created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -267,6 +278,7 @@ class AirlineRecoveryService:
                                                   FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? ORDER BY a.new_std""", (plan_id,))]
         if not rows: raise ApiError(409, "empty_plan", "方案没有飞行调整")
         problems: list[dict[str, Any]] = []
+        duty_overruns = crew_duty.overrun_assignment_ids(conn, plan_id)
         by_aircraft: dict[str, list[dict[str, Any]]] = {}
         by_crew: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -280,9 +292,8 @@ class AirlineRecoveryService:
             elif parse_time(aircraft["maintenance_due"]) < sta: problems.append({"assignment_id": row["id"], "code": "maintenance_due", "resource": aircraft["id"]})
             if not crew or crew["status"] != "active": problems.append({"assignment_id": row["id"], "code": "crew_unavailable"})
             if not origin or not destination: problems.append({"assignment_id": row["id"], "code": "airport_unknown"})
-            if crew:
-                duty_start, max_duty = parse_time(crew["duty_start"]), crew["max_duty_minutes"]
-                if (sta - duty_start).total_seconds() / 60 > max_duty: problems.append({"assignment_id": row["id"], "code": "duty_limit", "resource": crew["id"]})
+            if crew and row["id"] in duty_overruns:
+                problems.append({"assignment_id": row["id"], "code": "duty_limit", "resource": crew["id"]})
             if destination:
                 curfew_start, curfew_end = parse_clock(destination["curfew_start"]), parse_clock(destination["curfew_end"])
                 permit = conn.execute("""SELECT * FROM permits WHERE origin=? AND destination=? AND valid_from<=? AND valid_to>=?""",
@@ -311,6 +322,31 @@ class AirlineRecoveryService:
                 metrics = self._metrics(conn, plan_id)
                 conn.execute("UPDATE recovery_plans SET metrics_json=?,score_json=? WHERE id=?", (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), plan_id))
             return {"valid": not problems, "problems": problems, "plan": self.get_plan(plan_id)}
+
+    def crew_board(self, plan_id: int) -> dict[str, Any]:
+        conn = self.repo.conn
+        plan = conn.execute("SELECT id,name,status,revision,disruption_id FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+        if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+        board = crew_duty.accumulate(conn, plan_id)
+        for overrun in board["overruns"]:
+            overrun["candidates"] = crew_relief.list_candidates(conn, plan_id, overrun["assignment_id"])["candidates"]
+        return {"plan": dict(plan), "crews": board["crews"], "overruns": board["overruns"],
+                "relief_records": crew_relief.relief_records(conn, plan_id)}
+
+    def relieve_crew(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "relief_forbidden", "当前角色不能安排机组接替")
+        expected = body.get("expected_revision")
+        if not isinstance(expected, int): raise ApiError(400, "revision_required", "expected_revision 必须是整数")
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            if plan["status"] != "draft": raise ApiError(409, "plan_locked", "已锁定方案不能换班")
+            if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案版本已变化")
+            try:
+                result = crew_relief.apply_relief(conn, plan_id, actor, role, body, Repository.audit)
+            except crew_relief.ReliefError as exc:
+                raise ApiError(exc.status, exc.code, exc.message, exc.details) from exc
+            return {"relief": result, "board": self.crew_board(plan_id)}
 
     def _metrics(self, conn: sqlite3.Connection, plan_id: int) -> dict[str, Any]:
         rows = conn.execute("""SELECT a.*,f.passenger_count FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=?""", (plan_id,)).fetchall()
@@ -435,6 +471,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/state": return 200, self.service.state()
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]))
+        if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "crew-board":
+            return 200, self.service.crew_board(int(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit() and parts[3] == "compare": return 200, self.service.compare_plans(int(parts[2]))
         raise ApiError(404, "not_found", "接口不存在")
     def post_api(self, path: str) -> tuple[int, Any]:
@@ -454,6 +492,7 @@ class Handler(BaseHTTPRequestHandler):
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
             if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action == "relieve": return 200, self.service.relieve_crew(plan_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
@@ -464,6 +503,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if method == "GET" and parsed.path == "/":
                 raw = (self.web_root / "index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
+            if method == "GET" and parsed.path == "/crew":
+                raw = (self.web_root / "crew.html").read_bytes(); self.send_response(200); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw); return
             status, payload = self.get_api(parsed.path) if method == "GET" else self.post_api(parsed.path)
             respond(self, status, payload)
         except ApiError as exc:
